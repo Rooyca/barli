@@ -7,6 +7,7 @@ It runs shell commands (or plain executables) at given intervals and updates the
 
 ## Features
 - Simple text-based configuration file (`~/.config/barli.conf` or `~/.barli.conf`).  
+- Hot-reload configuration by sending `SIGUSR1` to the process (no restart required).
 - Runs commands periodically and displays their output.  
 - Supports both plain commands and full shell commands.  
 - Lightweight, written in Rust, with no external daemons.  
@@ -26,6 +27,11 @@ prefix :: command :: suffix :: interval :: [shell]
 - **suffix** → Text shown after command output  
 - **interval** → Update interval (seconds)  
 - **shell** → Optional, set to `shell` to run inside `/bin/sh -c`  
+
+> ![TIP] After editing your config file, you can reload it without restarting `barli` by running:
+> ```bash
+> pkill -USR1 barli
+> ```
 
 ### Example (`~/.config/barli.conf`)
 ```txt

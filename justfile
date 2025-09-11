@@ -2,6 +2,9 @@
 build:
     cargo build --release
 
+dev:
+    cargo run
+
 # Install binary to ~/.local/bin
 install: build
     mkdir -p ~/.local/bin

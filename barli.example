@@ -1,4 +1,0 @@
-󱞟  :: free -h | awk 'NR==2{print $3}' | tr -d 'i' :: :: 30 :: shell
- :: awk '{printf "%.1f", $1/1000}' /sys/class/thermal/thermal_zone0/temp ::  :: 30 :: shell
-󱊢 :: cat /sys/class/power_supply/BAT0/capacity :: % :: 60 ::
-  :: date '+%a %d %b %Y   %I:%M %p' :: :: :: shell

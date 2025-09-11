@@ -3,18 +3,15 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
   };
 
   outputs =
     {
       self,
       nixpkgs,
-      flake-utils,
     }:
-    flake-utils.lib.eachDefaultSystem (
-      system:
       let
+        system = "x86_64-linux";
         pkgs = import nixpkgs { inherit system; };
 
         x11Deps = [
@@ -22,12 +19,12 @@
         ];
       in
       {
-        packages.default = pkgs.rustPlatform.buildRustPackage {
+        packages.${system}.default = pkgs.rustPlatform.buildRustPackage {
           pname = "barli";
-          version = "0.1.0";
+          version = "0.1.1";
 
           src = self;
-          cargoHash = "sha256-3Oah+p3NV+JCdgNd+FzaEA2LzU0M5Z/zY76np6NHCxY=";
+          cargoHash = "sha256-JqLCm48EfhbCcOmQBFsDLyQaoDHMJgXn2/EGzHkShrY=";
 
           nativeBuildInputs = [
             pkgs.pkg-config
@@ -44,6 +41,5 @@
             pkgs.cargo
           ];
         };
-      }
-    );
+      };
 }

@@ -29,7 +29,8 @@ prefix :: command :: suffix :: interval :: [shell] :: [timeout_seconds]
 - **shell** → Optional, set to `shell` to run inside `/bin/sh -c`  
 - **timeout_seconds** → Optional, kills the command if it runs longer than this value  
 
-> ![TIP] After editing your config file, you can reload it without restarting `barli` by running:
+> [!TIP]
+> After editing your config file, you can reload it without restarting `barli` by running:
 > ```bash
 > pkill -USR1 barli
 > ```

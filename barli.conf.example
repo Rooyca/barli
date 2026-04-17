@@ -1,4 +1,4 @@
-󱞟 :: free -h | awk 'NR==2{print $3}' | tr -d 'i' :: :: 5 :: shell
+󱞟 :: free -h | awk 'NR==2{print $3}' | tr -d 'i' :: :: 5 :: shell :: 2
  :: awk '{printf "%.1f", $1/1000}' /sys/class/thermal/thermal_zone0/temp :: :: 50 :: shell
 󱊢 :: cat /sys/class/power_supply/BAT0/capacity :: % :: 60 ::
 # 󱊢 :: battery-noty :: :: 60 :: shell

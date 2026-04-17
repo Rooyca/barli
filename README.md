@@ -19,7 +19,7 @@ It runs shell commands (or plain executables) at given intervals and updates the
 Each line in the config defines a task:
 
 ```
-prefix :: command :: suffix :: interval :: [shell]
+prefix :: command :: suffix :: interval :: [shell] :: [timeout_seconds]
 ````
 
 - **prefix** → Text shown before command output  
@@ -27,6 +27,7 @@ prefix :: command :: suffix :: interval :: [shell]
 - **suffix** → Text shown after command output  
 - **interval** → Update interval (seconds)  
 - **shell** → Optional, set to `shell` to run inside `/bin/sh -c`  
+- **timeout_seconds** → Optional, kills the command if it runs longer than this value  
 
 > ![TIP] After editing your config file, you can reload it without restarting `barli` by running:
 > ```bash
@@ -36,7 +37,7 @@ prefix :: command :: suffix :: interval :: [shell]
 ### Example (`~/.config/barli.conf`)
 ```txt
 Clock :: date :: :: 2 :: 
-Mem :: free -h | awk 'NR==2{print $3}' :: used :: 10 :: shell
+Mem :: free -h | awk 'NR==2{print $3}' :: used :: 10 :: shell :: 2
 ````
 
 ---
@@ -67,4 +68,3 @@ barli &
 ```
 
 The bar text is stored in the root window name, so it will automatically be picked up by your WM’s status bar.
-

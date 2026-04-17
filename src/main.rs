@@ -1,16 +1,19 @@
+use signal_hook::{consts::signal::*, iterator::Signals};
 use std::{
     env,
     ffi::CString,
     fs,
     path::PathBuf,
-    process::Command,
+    process::{Command, Output, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc,
+        atomic::{AtomicBool, Ordering},
         mpsc::{Sender, channel},
     },
     thread,
     time::Duration,
 };
+use wait_timeout::ChildExt;
 use x11::xlib;
 
 #[derive(Debug, Clone)]
@@ -20,6 +23,7 @@ struct Task {
     suffix: String,
     interval: u64,
     shell: bool,
+    timeout: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -93,7 +97,7 @@ fn parse_line(line: &str) -> Option<Task> {
         return None;
     }
 
-    let parts: Vec<&str> = line.splitn(5, "::").collect();
+    let parts: Vec<&str> = line.splitn(6, "::").collect();
 
     // Need at least prefix and command
     if parts.len() < 2 {
@@ -118,6 +122,11 @@ fn parse_line(line: &str) -> Option<Task> {
             .get(4)
             .map(|s| s.trim().eq_ignore_ascii_case("shell"))
             .unwrap_or(false),
+        timeout: parts
+            .get(5)
+            .map(|s| s.trim())
+            .and_then(|s| s.parse().ok())
+            .filter(|seconds| *seconds > 0),
     };
 
     if task.is_valid() {
@@ -145,14 +154,18 @@ fn load_tasks() -> Result<Vec<Task>, BarliError> {
 
 /// Runs a command and returns its output
 fn run_command(task: &Task) -> Result<String, Box<dyn std::error::Error>> {
-    let output = if task.shell {
-        Command::new("sh").arg("-c").arg(&task.cmd).output()?
+    let mut command = if task.shell {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(&task.cmd);
+        command
     } else {
-        let mut parts = task.cmd.split_whitespace();
-        let cmd = parts.next().ok_or("[-] Empty command")?;
-        let args: Vec<&str> = parts.collect();
-        Command::new(cmd).args(&args).output()?
+        let parts = shlex::split(&task.cmd).ok_or("[-] Invalid quoted command syntax")?;
+        let cmd = parts.first().ok_or("[-] Empty command")?;
+        let mut command = Command::new(cmd);
+        command.args(parts.iter().skip(1));
+        command
     };
+    let output = run_with_timeout(&mut command, task.timeout)?;
 
     if !output.status.success() {
         return Err(format!(
@@ -170,15 +183,38 @@ fn run_command(task: &Task) -> Result<String, Box<dyn std::error::Error>> {
     Ok(result)
 }
 
+fn run_with_timeout(
+    command: &mut Command,
+    timeout_seconds: Option<u64>,
+) -> Result<Output, Box<dyn std::error::Error>> {
+    if let Some(timeout_seconds) = timeout_seconds {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = command.spawn()?;
+
+        if child
+            .wait_timeout(Duration::from_secs(timeout_seconds))?
+            .is_none()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("[-] Command timed out after {}s", timeout_seconds).into());
+        }
+
+        Ok(child.wait_with_output()?)
+    } else {
+        Ok(command.output()?)
+    }
+}
+
 /// Worker thread that can be signaled to stop
 struct WorkerHandle {
-    should_stop: Arc<Mutex<bool>>,
+    should_stop: Arc<AtomicBool>,
     join_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl WorkerHandle {
     fn new(idx: usize, task: Task, tx: Sender<AppMessage>) -> Self {
-        let should_stop = Arc::new(Mutex::new(false));
+        let should_stop = Arc::new(AtomicBool::new(false));
         let should_stop_clone = Arc::clone(&should_stop);
 
         let join_handle = thread::spawn(move || {
@@ -192,9 +228,7 @@ impl WorkerHandle {
     }
 
     fn stop(&mut self) {
-        if let Ok(mut should_stop) = self.should_stop.lock() {
-            *should_stop = true;
-        }
+        self.should_stop.store(true, Ordering::Relaxed);
 
         if let Some(handle) = self.join_handle.take() {
             let _ = handle.join();
@@ -203,17 +237,17 @@ impl WorkerHandle {
 }
 
 /// Worker thread loop that runs a task at intervals and can be stopped
-fn worker_loop(idx: usize, task: Task, tx: Sender<AppMessage>, should_stop: Arc<Mutex<bool>>) {
+fn worker_loop(idx: usize, task: Task, tx: Sender<AppMessage>, should_stop: Arc<AtomicBool>) {
+    let mut had_error = false;
+
     loop {
-        // Check if we should stop
-        if let Ok(should_stop) = should_stop.lock() {
-            if *should_stop {
-                break;
-            }
+        if should_stop.load(Ordering::Relaxed) {
+            break;
         }
 
         match run_command(&task) {
             Ok(result) if !result.is_empty() => {
+                had_error = false;
                 let full = if task.prefix.is_empty() && task.suffix.is_empty() {
                     format!(" {} ", result)
                 } else {
@@ -226,19 +260,27 @@ fn worker_loop(idx: usize, task: Task, tx: Sender<AppMessage>, should_stop: Arc<
                 }
             }
             Ok(_) => {
+                had_error = false;
                 // Empty result, send empty string to clear this task's output
                 if tx.send(AppMessage::TaskResult(idx, String::new())).is_err() {
                     break;
                 }
             }
             Err(e) => {
-                eprintln!("[-] Error running task '{}': {}", task.cmd, e);
-                // Send error indicator or empty string
+                if !had_error {
+                    eprintln!("[-] Error running task '{}': {}", task.cmd, e);
+                    had_error = true;
+                }
+
+                let prefix = task.prefix.trim();
+                let error_indicator = if prefix.is_empty() {
+                    " [ERR] ".to_string()
+                } else {
+                    format!(" [{}:ERR] ", prefix)
+                };
+
                 if tx
-                    .send(AppMessage::TaskResult(
-                        idx,
-                        format!(" [{}:ERR] ", task.prefix),
-                    ))
+                    .send(AppMessage::TaskResult(idx, error_indicator))
                     .is_err()
                 {
                     break;
@@ -252,10 +294,8 @@ fn worker_loop(idx: usize, task: Task, tx: Sender<AppMessage>, should_stop: Arc<
         let mut remaining = sleep_duration;
 
         while remaining > Duration::from_millis(0) {
-            if let Ok(should_stop) = should_stop.lock() {
-                if *should_stop {
-                    return;
-                }
+            if should_stop.load(Ordering::Relaxed) {
+                return;
             }
 
             let sleep_time = remaining.min(chunk_duration);
@@ -286,6 +326,14 @@ impl DisplayManager {
     }
 
     fn set_window_name(&self, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let sanitized;
+        let name = if name.as_bytes().contains(&0) {
+            sanitized = name.replace('\0', "");
+            sanitized.as_str()
+        } else {
+            name
+        };
+
         let c_str = CString::new(name)?;
         unsafe {
             xlib::XStoreName(self.display, self.window, c_str.as_ptr());
@@ -305,32 +353,22 @@ impl Drop for DisplayManager {
 
 /// Sets up signal handling for SIGUSR1 (reload config)
 fn setup_signal_handler(tx: Sender<AppMessage>) -> Result<(), BarliError> {
-    let tx_clone = tx.clone();
-
-    // Handle SIGUSR1 for config reload
-    unsafe {
-        signal_hook::low_level::register(signal_hook::consts::SIGUSR1, move || {
-            let _ = tx_clone.send(AppMessage::ReloadConfig);
-        })
+    let mut signals = Signals::new([SIGUSR1, SIGTERM, SIGINT])
         .map_err(|e| BarliError::SignalHandling(e.to_string()))?;
-    }
 
-    // Handle SIGTERM and SIGINT for graceful shutdown
-    let tx_clone = tx.clone();
-    unsafe {
-        signal_hook::low_level::register(signal_hook::consts::SIGTERM, move || {
-            let _ = tx_clone.send(AppMessage::Shutdown);
-        })
-        .map_err(|e| BarliError::SignalHandling(e.to_string()))?;
-    }
+    thread::spawn(move || {
+        for signal in signals.forever() {
+            let message = match signal {
+                SIGUSR1 => AppMessage::ReloadConfig,
+                SIGTERM | SIGINT => AppMessage::Shutdown,
+                _ => continue,
+            };
 
-    let tx_clone = tx;
-    unsafe {
-        signal_hook::low_level::register(signal_hook::consts::SIGINT, move || {
-            let _ = tx_clone.send(AppMessage::Shutdown);
-        })
-        .map_err(|e| BarliError::SignalHandling(e.to_string()))?;
-    }
+            if tx.send(message).is_err() {
+                break;
+            }
+        }
+    });
 
     Ok(())
 }
@@ -340,6 +378,7 @@ struct App {
     display_manager: DisplayManager,
     workers: Vec<WorkerHandle>,
     results: Vec<String>,
+    last_status: String,
 }
 
 impl App {
@@ -348,6 +387,7 @@ impl App {
             display_manager: DisplayManager::new()?,
             workers: Vec::new(),
             results: Vec::new(),
+            last_status: String::new(),
         })
     }
 
@@ -383,15 +423,18 @@ impl App {
         if idx < self.results.len() {
             self.results[idx] = text;
 
-            let status = self
-                .results
-                .iter()
-                .filter(|s| !s.is_empty())
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("|");
+            let mut status = String::new();
+            for part in self.results.iter().filter(|s| !s.is_empty()) {
+                if !status.is_empty() {
+                    status.push('|');
+                }
+                status.push_str(part);
+            }
 
-            self.display_manager.set_window_name(&status)?;
+            if status != self.last_status {
+                self.display_manager.set_window_name(&status)?;
+                self.last_status = status;
+            }
         }
         Ok(())
     }

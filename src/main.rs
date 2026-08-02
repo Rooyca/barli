@@ -26,6 +26,22 @@ struct Task {
     timeout: Option<u64>,
 }
 
+/// Parsed configuration: global options + task list
+#[derive(Debug, Clone)]
+struct Config {
+    separator: String,
+    tasks: Vec<Task>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            separator: " | ".to_string(),
+            tasks: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug)]
 enum BarliError {
     ConfigRead(std::io::Error),
@@ -88,7 +104,25 @@ fn resolve_config_path() -> Result<PathBuf, BarliError> {
     }
 }
 
+/// Strips a single pair of matching surrounding quotes so commands can be
+/// wrapped in quotes without those quotes being passed to the shell.
+fn strip_outer_quotes(s: &str) -> &str {
+    let s = s.trim();
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 {
+        let (first, last) = (bytes[0], bytes[bytes.len() - 1]);
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
+}
+
 /// Parses a configuration line into a Task
+///
+/// Format: `prefix :: command :: suffix :: interval :: [shell] :: [timeout]`
+/// The trailing `shell` keyword is accepted in any trailing field position so
+/// that omitting an empty `suffix` or `interval` no longer breaks the task.
 fn parse_line(line: &str) -> Option<Task> {
     let line = line.trim();
 
@@ -108,24 +142,40 @@ fn parse_line(line: &str) -> Option<Task> {
         return None;
     }
 
+    // The `shell` keyword is honored wherever it appears among the trailing
+    // fields, so missing `suffix`/`interval` slots don't shift it out of place.
+    let shell = parts
+        .iter()
+        .skip(2)
+        .any(|s| s.trim().eq_ignore_ascii_case("shell"));
+
+    // Prefix/suffix are kept verbatim (spacing included) so spaces the user
+    // writes around them show up in the bar. Whitespace-only fields mean "empty".
+    let prefix = if parts[0].trim().is_empty() {
+        String::new()
+    } else {
+        parts[0].to_string()
+    };
+    let suffix = parts
+        .get(2)
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
     let task = Task {
-        prefix: parts[0].to_string(),
-        cmd: parts[1].trim().to_string(),
-        suffix: parts.get(2).unwrap_or(&"").to_string(),
+        prefix,
+        cmd: strip_outer_quotes(parts[1]).to_string(),
+        suffix,
         interval: parts
             .get(3)
-            .map(|s| s.trim())
-            .and_then(|s| s.parse().ok())
+            .filter(|s| !s.trim().eq_ignore_ascii_case("shell"))
+            .and_then(|s| s.trim().parse().ok())
             .unwrap_or(1)
             .max(1), // Ensure minimum interval of 1 second
-        shell: parts
-            .get(4)
-            .map(|s| s.trim().eq_ignore_ascii_case("shell"))
-            .unwrap_or(false),
+        shell,
         timeout: parts
             .get(5)
-            .map(|s| s.trim())
-            .and_then(|s| s.parse().ok())
+            .and_then(|s| s.trim().parse().ok())
             .filter(|seconds| *seconds > 0),
     };
 
@@ -137,19 +187,49 @@ fn parse_line(line: &str) -> Option<Task> {
     }
 }
 
-/// Loads tasks from config file
-fn load_tasks() -> Result<Vec<Task>, BarliError> {
+/// Parses a global option line from the config file.
+///
+/// Format: `OPTION: value` (single colon)
+fn parse_option(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+
+    // Skip empty lines and comments
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+
+    let parts: Vec<&str> = line.splitn(2, ':').map(|s| s.trim()).collect();
+
+    if parts.len() == 2 && parts[0].eq_ignore_ascii_case("separator") {
+        Some(("separator".to_string(), strip_outer_quotes(parts[1]).to_string()))
+    } else {
+        None
+    }
+}
+
+/// Loads tasks and global options from config file
+fn load_config() -> Result<Config, BarliError> {
     let config_path = resolve_config_path()?;
     let contents = fs::read_to_string(&config_path).map_err(BarliError::ConfigRead)?;
 
-    let tasks: Vec<Task> = contents.lines().filter_map(parse_line).collect();
+    let mut config = Config::default();
+
+    for line in contents.lines() {
+        if let Some((option, value)) = parse_option(line) {
+            if option.as_str() == "separator" {
+                config.separator = value;
+            }
+        } else if let Some(task) = parse_line(line) {
+            config.tasks.push(task);
+        }
+    }
 
     println!(
         "[+] Loaded {} tasks from {}",
-        tasks.len(),
+        config.tasks.len(),
         config_path.display()
     );
-    Ok(tasks)
+    Ok(config)
 }
 
 /// Runs a command and returns its output
@@ -379,6 +459,7 @@ struct App {
     workers: Vec<WorkerHandle>,
     results: Vec<String>,
     last_status: String,
+    separator: String,
 }
 
 impl App {
@@ -388,18 +469,21 @@ impl App {
             workers: Vec::new(),
             results: Vec::new(),
             last_status: String::new(),
+            separator: " | ".to_string(),
         })
     }
 
-    fn start_workers(&mut self, tasks: Vec<Task>, tx: Sender<AppMessage>) {
+    fn start_workers(&mut self, config: Config, tx: Sender<AppMessage>) {
         // Stop existing workers
         self.stop_workers();
 
+        self.separator = config.separator;
+
         // Resize results vector
-        self.results = vec![String::new(); tasks.len()];
+        self.results = vec![String::new(); config.tasks.len()];
 
         // Start new workers
-        for (i, task) in tasks.into_iter().enumerate() {
+        for (i, task) in config.tasks.into_iter().enumerate() {
             let worker = WorkerHandle::new(i, task, tx.clone());
             self.workers.push(worker);
         }
@@ -426,7 +510,7 @@ impl App {
             let mut status = String::new();
             for part in self.results.iter().filter(|s| !s.is_empty()) {
                 if !status.is_empty() {
-                    status.push('|');
+                    status.push_str(&self.separator);
                 }
                 status.push_str(part);
             }
@@ -441,10 +525,10 @@ impl App {
 
     fn reload_config(&mut self, tx: Sender<AppMessage>) -> Result<(), BarliError> {
         println!("[|] Reloading configuration...");
-        match load_tasks() {
-            Ok(tasks) => {
-                if !tasks.is_empty() {
-                    self.start_workers(tasks, tx);
+        match load_config() {
+            Ok(config) => {
+                if !config.tasks.is_empty() {
+                    self.start_workers(config, tx);
                     println!("[*] Configuration reloaded successfully");
                 } else {
                     eprintln!("[-] No valid tasks found in config file");
@@ -468,13 +552,13 @@ fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     setup_signal_handler(tx.clone())?;
 
     // Load initial configuration
-    let initial_tasks = load_tasks()?;
-    if initial_tasks.is_empty() {
+    let initial_config = load_config()?;
+    if initial_config.tasks.is_empty() {
         eprintln!("[-] No valid tasks found in config file");
         return Ok(());
     }
 
-    app.start_workers(initial_tasks, tx.clone());
+    app.start_workers(initial_config, tx.clone());
 
     println!("[+] Send SIGUSR1 to reload config, SIGTERM/SIGINT to quit.");
 

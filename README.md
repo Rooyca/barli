@@ -20,7 +20,7 @@ Each line in the config defines a task:
 
 ```
 prefix :: command :: suffix :: interval :: [shell] :: [timeout_seconds]
-````
+```
 
 - **prefix** → Text shown before command output  
 - **command** → The command to run  
@@ -28,6 +28,19 @@ prefix :: command :: suffix :: interval :: [shell] :: [timeout_seconds]
 - **interval** → Update interval (seconds)  
 - **shell** → Optional, set to `shell` to run inside `/bin/sh -c`  
 - **timeout_seconds** → Optional, kills the command if it runs longer than this value  
+
+### Global options
+
+Global options use the format `OPTION: value` and can appear anywhere in the file:
+
+- **SEPARATOR** → Text placed between each task's output to keep the bar readable (default: ` | `)
+
+```
+SEPARATOR: " | "
+```
+
+> [!NOTE]
+> Spaces around `prefix` and `suffix` in a task line are kept verbatim, so add a space (e.g. `󱞟 :: ...`) if you want breathing room before or after a task's output.
 
 > [!TIP]
 > After editing your config file, you can reload it without restarting `barli` by running:
@@ -37,6 +50,7 @@ prefix :: command :: suffix :: interval :: [shell] :: [timeout_seconds]
 
 ### Example (`~/.config/barli.conf`)
 ```txt
+SEPARATOR: " | "
 Clock :: date :: :: 2 :: 
 Mem :: free -h | awk 'NR==2{print $3}' :: used :: 10 :: shell :: 2
 ````
